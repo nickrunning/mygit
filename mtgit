@@ -1,0 +1,324 @@
+#!/bin/bash
+
+# 默认值
+MAX_DEPTH=99
+TARGET_DIR="."
+SHOW_HELP=0
+
+# 颜色定义
+COLOR_RESET='\033[0m'
+COLOR_YELLOW='\033[1;33m'
+COLOR_GREEN='\033[1;32m'
+COLOR_RED='\033[1;31m'
+COLOR_CYAN='\033[1;36m'
+COLOR_BLUE='\033[1;34m'
+
+# 帮助信息
+show_help() {
+    cat << EOF
+Usage: $(basename $0) [-d depth] [-h] [directory]
+
+交互式 git 仓库管理工具（类似 tig 的多仓库版本）
+
+Options:
+    -d depth    设置查找 git 仓库的最大深度 (默认: 无限递归)
+    -h          显示此帮助信息
+
+Arguments:
+    directory   要搜索的目录 (默认: 当前目录 .)
+
+功能说明：
+    1. 列出所有 git 仓库及其状态
+    2. 选择仓库后可以：
+       - 查看详细状态 (status)
+       - 查看 diff
+       - 查看统计 (stat)
+       - 进入 tig 查看历史
+       - 提交改动 (commit)
+       - 推送 (push)
+       - 拉取 (pull)
+       - 打开仓库目录
+
+快捷键：
+    ↑/↓ 或 j/k    - 上下移动
+    Enter         - 选择仓库，进入操作菜单
+    Ctrl+C 或 q   - 退出
+
+Examples:
+    $(basename $0)              # 查找当前目录下所有仓库
+    $(basename $0) components   # 查找 components 目录
+    $(basename $0) -d 2         # 限制深度为 2
+
+依赖：
+    - fzf (用于交互式选择)
+    - tig (可选，用于查看历史)
+
+安装 fzf：
+    sudo apt install fzf        # Debian/Ubuntu
+    brew install fzf            # macOS
+EOF
+}
+
+# 解析参数
+while getopts "d:h" opt; do
+    case $opt in
+        d)
+            MAX_DEPTH=$OPTARG
+            if ! [[ "$MAX_DEPTH" =~ ^[0-9]+$ ]]; then
+                echo "错误: -d 参数必须是正整数" >&2
+                show_help
+                exit 1
+            fi
+            ;;
+        h)
+            show_help
+            exit 0
+            ;;
+        ?)
+            show_help
+            exit 1
+            ;;
+    esac
+done
+
+# 获取位置参数（目录）
+shift $((OPTIND - 1))
+if [ $# -gt 0 ]; then
+    TARGET_DIR="$1"
+    if [ ! -d "$TARGET_DIR" ]; then
+        echo "错误: 目录 '$TARGET_DIR' 不存在" >&2
+        exit 1
+    fi
+fi
+
+# 检查依赖
+if ! command -v fzf &> /dev/null; then
+    echo "错误: 需要安装 fzf" >&2
+    echo "安装: sudo apt install fzf (Debian/Ubuntu) 或 brew install fzf (macOS)" >&2
+    exit 1
+fi
+
+# 获取仓库状态信息
+get_repo_status() {
+    local repo_path="$1"
+    cd "$repo_path"
+    
+    local branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "no-branch")
+    local status=""
+    local status_symbol=""
+    local color=""
+    
+    # 检查是否有改动
+    if [ -n "$(git status --porcelain 2>/dev/null)" ]; then
+        # 有改动
+        local modified=$(git status --porcelain 2>/dev/null | grep -c "^ M" || echo 0)
+        local added=$(git status --porcelain 2>/dev/null | grep -c "^A " || echo 0)
+        local deleted=$(git status --porcelain 2>/dev/null | grep -c "^D " || echo 0)
+        local untracked=$(git status --porcelain 2>/dev/null | grep -c "^??" || echo 0)
+        local staged=$(git diff --cached --numstat 2>/dev/null | wc -l)
+        
+        status="M:$modified A:$added D:$deleted ?:$untracked S:$staged"
+        status_symbol="✗"
+        color="$COLOR_RED"
+    else
+        # 检查是否需要 push/pull
+        local ahead=$(git rev-list --count @{u}..HEAD 2>/dev/null || echo 0)
+        local behind=$(git rev-list --count HEAD..@{u} 2>/dev/null || echo 0)
+        
+        if [ "$ahead" -gt 0 ] || [ "$behind" -gt 0 ]; then
+            status="↑$ahead ↓$behind"
+            status_symbol="⇅"
+            color="$COLOR_YELLOW"
+        else
+            status="clean"
+            status_symbol="✓"
+            color="$COLOR_GREEN"
+        fi
+    fi
+    
+    echo -e "${color}${status_symbol}${COLOR_RESET} ${COLOR_CYAN}${repo_path}${COLOR_RESET} ${COLOR_BLUE}[$branch]${COLOR_RESET} $status"
+}
+
+# 列出所有仓库
+list_repos() {
+    local temp_file=$(mktemp)
+    
+    find "$TARGET_DIR" -maxdepth $MAX_DEPTH -type d -name .git 2>/dev/null | sort | while read git_dir; do
+        local repo_path=$(dirname "$git_dir")
+        echo "$repo_path"
+    done > "$temp_file"
+    
+    cat "$temp_file"
+    rm -f "$temp_file"
+}
+
+# 显示仓库操作菜单
+show_repo_menu() {
+    local repo_path="$1"
+    
+    while true; do
+        clear
+        echo -e "${COLOR_YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${COLOR_RESET}"
+        echo -e "${COLOR_CYAN}仓库: $repo_path${COLOR_RESET}"
+        echo -e "${COLOR_YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${COLOR_RESET}"
+        echo ""
+        
+        cd "$repo_path"
+        
+        # 显示当前状态摘要
+        local branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
+        echo -e "${COLOR_BLUE}分支:${COLOR_RESET} $branch"
+        echo ""
+        
+        # 简短状态
+        if [ -n "$(git status --porcelain)" ]; then
+            echo -e "${COLOR_RED}有未提交的改动${COLOR_RESET}"
+            git status --short
+        else
+            echo -e "${COLOR_GREEN}工作区干净${COLOR_RESET}"
+        fi
+        
+        echo ""
+        echo -e "${COLOR_YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${COLOR_RESET}"
+        
+        # 使用 fzf 显示操作菜单
+        local action=$(echo -e "📊 查看详细状态 (status)\n📝 查看差异 (diff)\n📈 查看统计 (stat)\n📜 查看历史 (tig)\n✅ 提交改动 (commit)\n⬆️  推送 (push)\n⬇️  拉取 (pull)\n🔄 同步 (pull + push)\n📁 打开目录 (cd)\n🔙 返回仓库列表\n❌ 退出" | \
+            fzf --height=50% --reverse --border --prompt="选择操作 > " --ansi --header="使用 ↑↓ 选择，Enter 确认，Ctrl+C 取消")
+        
+        case "$action" in
+            *"查看详细状态"*)
+                clear
+                git -c color.status=always status
+                echo ""
+                read -p "按 Enter 继续..."
+                ;;
+            *"查看差异"*)
+                clear
+                git diff --color=always | less -RFX
+                ;;
+            *"查看统计"*)
+                clear
+                git diff --stat --color=always
+                echo ""
+                read -p "按 Enter 继续..."
+                ;;
+            *"查看历史"*)
+                if command -v tig &> /dev/null; then
+                    tig
+                else
+                    clear
+                    git log --oneline --graph --color=always -20 | less -RFX
+                fi
+                ;;
+            *"提交改动"*)
+                clear
+                git status --short
+                echo ""
+                read -p "是否暂存所有改动? (y/N): " stage_all
+                if [[ "$stage_all" =~ ^[Yy]$ ]]; then
+                    git add -A
+                fi
+                
+                echo ""
+                git status --short
+                echo ""
+                read -p "提交信息: " commit_msg
+                if [ -n "$commit_msg" ]; then
+                    git commit -m "$commit_msg"
+                    echo ""
+                    read -p "按 Enter 继续..."
+                fi
+                ;;
+            *"推送"*)
+                clear
+                git push
+                echo ""
+                read -p "按 Enter 继续..."
+                ;;
+            *"拉取"*)
+                clear
+                git pull
+                echo ""
+                read -p "按 Enter 继续..."
+                ;;
+            *"同步"*)
+                clear
+                git pull && git push
+                echo ""
+                read -p "按 Enter 继续..."
+                ;;
+            *"打开目录"*)
+                clear
+                echo "在新 shell 中打开仓库目录: $repo_path"
+                echo "使用 exit 或 Ctrl+D 返回 mygit"
+                echo ""
+                cd "$repo_path" && $SHELL
+                ;;
+            *"返回仓库列表"*)
+                return 0
+                ;;
+            *"退出"*|"")
+                exit 0
+                ;;
+        esac
+    done
+}
+
+# 主循环
+main() {
+    while true; do
+        # 生成仓库列表并显示状态
+        local temp_list=$(mktemp)
+        local temp_map=$(mktemp)
+        
+        echo "正在扫描仓库..." >&2
+        
+        local index=1
+        find "$TARGET_DIR" -maxdepth $MAX_DEPTH -type d -name .git 2>/dev/null | sort | while read git_dir; do
+            local repo_path=$(dirname "$git_dir")
+            local status_line=$(get_repo_status "$repo_path")
+            echo "$status_line" >> "$temp_list"
+            echo "$index|$repo_path" >> "$temp_map"
+            index=$((index + 1))
+        done
+        
+        if [ ! -s "$temp_list" ]; then
+            echo "未找到任何 git 仓库" >&2
+            rm -f "$temp_list" "$temp_map"
+            exit 1
+        fi
+        
+        # 使用 fzf 选择仓库
+        local selected=$(cat "$temp_list" | \
+            fzf --ansi \
+                --height=100% \
+                --reverse \
+                --border \
+                --prompt="选择仓库 > " \
+                --header="搜索深度: $MAX_DEPTH | 目录: $TARGET_DIR | ↑↓ 选择, Enter 确认, Ctrl+C 退出" \
+                --preview='repo_path=$(echo {} | grep -oP "(?<=\x1b\[1;36m)[^\x1b]+(?=\x1b)" || echo {} | awk "{print \$2}"); cd "$repo_path" 2>/dev/null && git -c color.status=always status' \
+                --preview-window=right:60%:wrap)
+        
+        if [ -z "$selected" ]; then
+            rm -f "$temp_list" "$temp_map"
+            exit 0
+        fi
+        
+        # 提取仓库路径（从 ANSI 颜色代码中）
+        local repo_path=$(echo "$selected" | grep -oP "(?<=\x1b\[1;36m)[^\x1b]+" | head -1)
+        
+        if [ -z "$repo_path" ]; then
+            # 备用提取方法
+            repo_path=$(echo "$selected" | awk '{print $2}')
+        fi
+        
+        rm -f "$temp_list" "$temp_map"
+        
+        if [ -n "$repo_path" ] && [ -d "$repo_path" ]; then
+            show_repo_menu "$repo_path"
+        fi
+    done
+}
+
+# 运行主程序
+main
